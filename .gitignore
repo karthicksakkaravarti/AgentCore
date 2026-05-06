@@ -1,0 +1,14 @@
+# Local copies and generated workspace material
+/agent-core copy/
+/runtime/
+/src/
+
+# Dependencies and build output
+node_modules/
+dist/
+
+# Local environment and OS files
+.env
+.env.*
+!.env.example
+.DS_Store
