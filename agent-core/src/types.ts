@@ -1,12 +1,17 @@
-import type { Anthropic } from "@anthropic-ai/sdk";
+import type {
+  JsonObject,
+  NeutralMessage,
+  NeutralUsage,
+} from "./providers/types.js";
+import type { Runtime } from "./runtime/types.js";
+import type { SessionStorageBackend } from "./sessionStorage.js";
+import type { Workspace } from "./workspace/types.js";
 
 export type PermissionMode =
   | "default"
   | "acceptEdits"
   | "bypassPermissions"
   | "plan";
-
-export type JsonObject = Record<string, unknown>;
 
 export type ToolResult = {
   content: string;
@@ -15,6 +20,8 @@ export type ToolResult = {
 
 export type ToolExecutionContext = {
   cwd: string;
+  workspace: Workspace;
+  runtime: Runtime;
   abortSignal: AbortSignal;
   state: AgentState;
   askUser?: (question: string) => Promise<string>;
@@ -24,7 +31,7 @@ export type ToolExecutionContext = {
 export type AgentTool = {
   name: string;
   description: string;
-  inputSchema: Anthropic.Tool.InputSchema;
+  inputSchema: JsonObject;
   readOnly: boolean | ((input: JsonObject) => boolean);
   destructive?: boolean | ((input: JsonObject) => boolean);
   concurrencySafe?: boolean | ((input: JsonObject) => boolean);
@@ -48,8 +55,11 @@ export type AgentOptions = {
   apiKey?: string;
   model?: string;
   cwd?: string;
+  workspace?: Workspace;
+  runtime?: Runtime;
+  sessionStorage?: SessionStorageBackend;
   sessionId?: string;
-  initialMessages?: Anthropic.MessageParam[];
+  initialMessages?: NeutralMessage[];
   initialUsage?: AgentState["usage"];
   persistSession?: boolean;
   additionalInstructionDirs?: string[];
@@ -95,16 +105,20 @@ export type AgentState = {
   alwaysAllowedTools: Set<string>;
   alwaysDeniedTools: Set<string>;
   readFiles: Set<string>;
-  usage: {
-    inputTokens: number;
-    outputTokens: number;
-    cacheCreationInputTokens: number;
-    cacheReadInputTokens: number;
-  };
+  usage: NeutralUsage;
 };
 
 export type AgentEvent =
   | { type: "request"; turn: number; model: string }
+  | { type: "text_delta"; text: string }
+  | {
+      type: "tool_use_delta";
+      id: string;
+      name?: string;
+      partialJson?: string;
+      input?: JsonObject;
+      done?: boolean;
+    }
   | { type: "assistant_text"; text: string }
   | {
       type: "tool_start";
@@ -120,7 +134,7 @@ export type AgentEvent =
     }
   | {
       type: "assistant_message";
-      message: Anthropic.Message;
+      message: NeutralMessage;
     }
   | {
       type: "usage";
@@ -130,7 +144,18 @@ export type AgentEvent =
 export type AgentRunResult = {
   text: string;
   sessionId: string;
-  messages: Anthropic.MessageParam[];
+  messages: NeutralMessage[];
   usage: AgentState["usage"];
-  stoppedBy: "end_turn" | "max_turns" | "error";
+  stoppedBy: "end_turn" | "max_turns" | "max_tokens" | "error" | "other";
 };
+
+export type {
+  JsonObject,
+  NeutralContentBlock,
+  NeutralMessage,
+  NeutralRole,
+  NeutralToolDefinition,
+  NeutralUsage,
+  ProviderStopReason,
+  ProviderStreamEvent,
+} from "./providers/types.js";

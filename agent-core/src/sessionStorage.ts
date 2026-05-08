@@ -1,13 +1,12 @@
-import type { Anthropic } from "@anthropic-ai/sdk";
 import crypto from "node:crypto";
 import { createReadStream } from "node:fs";
 import { appendFile, mkdir, readdir, stat, writeFile } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+import type { NeutralContentBlock, NeutralMessage } from "./providers/types.js";
 import type { AgentState } from "./types.js";
 
-const STORAGE_VERSION = 1;
+export const STORAGE_VERSION = 2;
 
 export type SessionMetadata = {
   version: number;
@@ -27,7 +26,7 @@ export type TranscriptEntry =
   | {
       type: "message";
       at: string;
-      message: Anthropic.MessageParam;
+      message: NeutralMessage;
     }
   | {
       type: "usage";
@@ -38,7 +37,7 @@ export type TranscriptEntry =
 export type LoadedSession = {
   metadata: SessionMetadata;
   path: string;
-  messages: Anthropic.MessageParam[];
+  messages: NeutralMessage[];
   usage?: AgentState["usage"];
 };
 
@@ -53,22 +52,105 @@ export type SessionSummary = {
   messageCount: number;
 };
 
+export type SessionStorageInitOptions = {
+  cwd: string;
+  model: string;
+  sessionId: string;
+  title?: string;
+};
+
+export type SessionFilter = {
+  cwd?: string;
+};
+
+export interface SessionStorageBackend {
+  readonly id: string;
+  initSession(options: SessionStorageInitOptions): Promise<SessionMetadata>;
+  appendEntry(sessionId: string, entry: TranscriptEntry): Promise<void>;
+  loadTranscript(sessionId: string): Promise<TranscriptEntry[]>;
+  listSessions(filter?: SessionFilter): Promise<SessionSummary[]>;
+  getSessionPath?(sessionId: string): string;
+}
+
+export class FileSystemSessionStorage implements SessionStorageBackend {
+  readonly id = "filesystem";
+  private readonly cwd: string;
+
+  constructor(options: { cwd: string }) {
+    this.cwd = options.cwd;
+  }
+
+  initSession(options: SessionStorageInitOptions): Promise<SessionMetadata> {
+    return initializeTranscript({
+      cwd: options.cwd ?? this.cwd,
+      model: options.model,
+      sessionId: options.sessionId,
+      title: options.title,
+    });
+  }
+
+  appendEntry(sessionId: string, entry: TranscriptEntry): Promise<void> {
+    return appendTranscriptEntry(this.cwd, sessionId, entry);
+  }
+
+  loadTranscript(sessionId: string): Promise<TranscriptEntry[]> {
+    return readTranscriptEntries(this.getSessionPath(sessionId));
+  }
+
+  listSessions(filter: SessionFilter = {}): Promise<SessionSummary[]> {
+    return listSessions(filter.cwd ?? this.cwd);
+  }
+
+  getSessionPath(sessionId: string): string {
+    return getSessionPath(this.cwd, sessionId);
+  }
+}
+
+export class NullSessionStorage implements SessionStorageBackend {
+  readonly id = "null";
+
+  async initSession(options: SessionStorageInitOptions): Promise<SessionMetadata> {
+    return createSessionMetadata(options);
+  }
+
+  async appendEntry(
+    _sessionId: string,
+    _entry: TranscriptEntry,
+  ): Promise<void> {
+    return undefined;
+  }
+
+  async loadTranscript(_sessionId: string): Promise<TranscriptEntry[]> {
+    return [];
+  }
+
+  async listSessions(_filter: SessionFilter = {}): Promise<SessionSummary[]> {
+    return [];
+  }
+}
+
 export function createSessionId(): string {
   return crypto.randomUUID();
 }
 
 export function getAgentCoreHome(): string {
-  return (
-    process.env.AGENT_CORE_HOME ||
-    path.join(os.homedir(), ".agent-core")
-  );
+  return process.env.AGENT_CORE_HOME || "";
 }
 
 export function getProjectStorageDir(cwd: string): string {
   const resolved = path.resolve(cwd);
-  const label = path.basename(resolved).replace(/[^A-Za-z0-9._-]+/g, "-") || "project";
-  const hash = crypto.createHash("sha1").update(resolved).digest("hex").slice(0, 12);
-  return path.join(getAgentCoreHome(), "projects", `${label}-${hash}`);
+  const homeOverride = getAgentCoreHome();
+  if (homeOverride) {
+    const label =
+      path.basename(resolved).replace(/[^A-Za-z0-9._-]+/g, "-") || "project";
+    const hash = crypto
+      .createHash("sha1")
+      .update(resolved)
+      .digest("hex")
+      .slice(0, 12);
+    return path.join(homeOverride, "projects", `${label}-${hash}`);
+  }
+  return path.join(resolved, ".agent-core", "sessions");
 }
 
 export function getSessionPath(cwd: string, sessionId: string): string {
@@ -81,16 +163,7 @@ export async function initializeTranscript(options: {
   sessionId: string;
   title?: string;
 }): Promise<SessionMetadata> {
-  const now = new Date().toISOString();
-  const metadata: SessionMetadata = {
-    version: STORAGE_VERSION,
-    sessionId: options.sessionId,
-    cwd: path.resolve(options.cwd),
-    model: options.model,
-    createdAt: now,
-    updatedAt: now,
-    title: options.title,
-  };
+  const metadata = createSessionMetadata(options);
   const filePath = getSessionPath(options.cwd, options.sessionId);
   await mkdir(path.dirname(filePath), { recursive: true });
   try {
@@ -103,6 +176,21 @@ export async function initializeTranscript(options: {
     });
     return metadata;
   }
+}
+
+export function createSessionMetadata(
+  options: SessionStorageInitOptions,
+): SessionMetadata {
+  const now = new Date().toISOString();
+  return {
+    version: STORAGE_VERSION,
+    sessionId: options.sessionId,
+    cwd: path.resolve(options.cwd),
+    model: options.model,
+    createdAt: now,
+    updatedAt: now,
+    title: options.title,
+  };
 }
 
 export async function appendTranscriptEntry(
@@ -118,7 +206,7 @@ export async function appendTranscriptEntry(
 export async function recordMessage(
   cwd: string,
   sessionId: string,
-  message: Anthropic.MessageParam,
+  message: NeutralMessage,
 ): Promise<void> {
   await appendTranscriptEntry(cwd, sessionId, {
     type: "message",
@@ -170,11 +258,13 @@ export async function loadSessionById(
   const entries = await readTranscriptEntries(filePath);
   let metadata: SessionMetadata | undefined;
   let usage: AgentState["usage"] | undefined;
-  const messages: Anthropic.MessageParam[] = [];
+  const messages: NeutralMessage[] = [];
 
   for (const entry of entries) {
     if (entry.type === "metadata") metadata = entry.metadata;
-    if (entry.type === "message") messages.push(entry.message);
+    if (entry.type === "message") {
+      messages.push(normalizeTranscriptMessage(entry.message));
+    }
     if (entry.type === "usage") usage = entry.usage;
   }
 
@@ -229,7 +319,7 @@ async function summarizeSession(filePath: string): Promise<SessionSummary | null
       messageCount += 1;
       lastAt = entry.at;
       if (!firstUserTitle && entry.message.role === "user") {
-        const text = extractText(entry.message);
+        const text = extractText(normalizeTranscriptMessage(entry.message));
         if (!text.includes("<context-attachment")) {
           firstUserTitle = text.slice(0, 80);
         }
@@ -284,23 +374,96 @@ async function exists(filePath: string): Promise<boolean> {
   }
 }
 
-function extractText(message: Anthropic.MessageParam): string {
-  if (typeof message.content === "string") return message.content.trim();
-  if (Array.isArray(message.content)) {
-    return message.content
-      .map((block) => {
-        if (
-          typeof block === "object" &&
-          block !== null &&
-          "text" in block &&
-          typeof block.text === "string"
-        ) {
-          return block.text;
-        }
-        return "";
-      })
+function extractText(message: NeutralMessage): string {
+  return message.content
+    .map((block) => (block.type === "text" ? block.text : ""))
+    .join(" ")
+    .trim();
+}
+
+function normalizeTranscriptMessage(message: unknown): NeutralMessage {
+  const value = message as { role?: unknown; content?: unknown };
+  return {
+    role: value.role === "assistant" ? "assistant" : "user",
+    content: normalizeContentBlocks(value.content),
+  };
+}
+
+function normalizeContentBlocks(content: unknown): NeutralContentBlock[] {
+  if (typeof content === "string") {
+    return [{ type: "text", text: content }];
+  }
+  if (!Array.isArray(content)) {
+    return [{ type: "text", text: "" }];
+  }
+
+  const blocks = content
+    .map(normalizeContentBlock)
+    .filter((block): block is NeutralContentBlock => block !== null);
+  return blocks.length > 0 ? blocks : [{ type: "text", text: "" }];
+}
+
+function normalizeContentBlock(block: unknown): NeutralContentBlock | null {
+  if (typeof block !== "object" || block === null) return null;
+  const value = block as Record<string, unknown>;
+  if (value.type === "text" && typeof value.text === "string") {
+    return { type: "text", text: value.text };
+  }
+  if (
+    value.type === "tool_use" &&
+    typeof value.id === "string" &&
+    typeof value.name === "string"
+  ) {
+    return {
+      type: "tool_use",
+      id: value.id,
+      name: value.name,
+      input: normalizeJsonObject(value.input),
+    };
+  }
+  if (value.type === "tool_result") {
+    const toolUseId =
+      typeof value.toolUseId === "string"
+        ? value.toolUseId
+        : typeof value.tool_use_id === "string"
+          ? value.tool_use_id
+          : "";
+    if (!toolUseId) return null;
+    return {
+      type: "tool_result",
+      toolUseId,
+      content: normalizeToolResultContent(value.content),
+      isError:
+        value.isError === true ||
+        value.is_error === true ||
+        undefined,
+    };
+  }
+  return null;
+}
+
+function normalizeToolResultContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const text = content
+      .map((block) =>
+        typeof block === "object" &&
+        block !== null &&
+        "text" in block &&
+        typeof block.text === "string"
+          ? block.text
+          : "",
+      )
       .join(" ")
       .trim();
+    if (text) return text;
   }
-  return "";
+  if (content == null) return "";
+  return JSON.stringify(content);
+}
+
+function normalizeJsonObject(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
 }

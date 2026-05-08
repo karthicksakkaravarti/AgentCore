@@ -2,22 +2,22 @@
 import "dotenv/config";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { AgentCore } from "./agent.js";
 import {
+  AgentCore,
+  listProviders,
   listSessions,
   loadLatestSession,
   loadSessionById,
+  parseProviderModel,
+  type AgentEvent,
+  type AgentTool,
+  type JsonObject,
   type LoadedSession,
+  type PermissionDecision,
+  type PermissionMode,
   type SessionSummary,
-} from "./sessionStorage.js";
-import type {
-  AgentEvent,
-  AgentTool,
-  JsonObject,
-  PermissionDecision,
-  PermissionMode,
-} from "./types.js";
-import { truncateMiddle } from "./utils/json.js";
+} from "@agent-core/core";
+import { truncateMiddle } from "./format.js";
 
 type CliArgs = {
   apiKey?: string;
@@ -52,14 +52,21 @@ async function main(): Promise<void> {
   }
 
   const restored = await resolveSessionSelection(args, rl, cwd);
+  const selectedModel =
+    args.model ??
+    restored?.metadata.model ??
+    process.env.AGENT_CORE_MODEL ??
+    process.env.ANTHROPIC_MODEL ??
+    "claude-sonnet-4-6";
+  const provider = resolveProviderInfo(selectedModel);
   const apiKey =
     args.apiKey ??
-    process.env.ANTHROPIC_API_KEY ??
-    (await questionHidden("Anthropic API key: "));
+    process.env[provider.envKey] ??
+    (await questionHidden(`${provider.id} API key (${provider.envKey}): `));
 
   const agent = new AgentCore({
     apiKey,
-    model: args.model ?? restored?.metadata.model,
+    model: selectedModel,
     cwd,
     sessionId: restored?.metadata.sessionId,
     initialMessages: restored?.messages,
@@ -78,7 +85,7 @@ async function main(): Promise<void> {
   });
 
   output.write(
-    `Agent core ready. Model: ${args.model ?? restored?.metadata.model ?? process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6"}\n`,
+    `Agent core ready. Model: ${selectedModel}\n`,
   );
   output.write(`CWD: ${cwd}\n`);
   output.write(`Session: ${agent.getSessionInfo().sessionId}\n`);
@@ -90,6 +97,7 @@ async function main(): Promise<void> {
 
   if (args.prompt) {
     const result = await agent.run(args.prompt);
+    if (result.text) output.write("\n");
     if (result.stoppedBy !== "end_turn") {
       output.write(`\nStopped by ${result.stoppedBy}.\n`);
     }
@@ -121,8 +129,14 @@ async function main(): Promise<void> {
     }
     if (prompt.startsWith("/model ")) {
       const model = prompt.slice("/model ".length).trim();
-      agent.setModel(model);
-      output.write(`Model set to ${model}\n`);
+      try {
+        agent.setModel(model);
+        output.write(`Model set to ${model}\n`);
+      } catch (error) {
+        output.write(
+          `${error instanceof Error ? error.message : String(error)}\n`,
+        );
+      }
       continue;
     }
 
@@ -319,13 +333,24 @@ async function promptForPermission(
 }
 
 function createEventPrinter(verbose: boolean): (event: AgentEvent) => void {
+  let sawTextDelta = false;
   return (event) => {
     switch (event.type) {
       case "request":
         output.write(`\n[turn ${event.turn}] ${event.model}\n`);
+        sawTextDelta = false;
+        break;
+      case "text_delta":
+        sawTextDelta = true;
+        output.write(event.text);
+        break;
+      case "tool_use_delta":
+        if (verbose && event.partialJson) {
+          output.write(`[tool input] ${event.id} ${event.partialJson}\n`);
+        }
         break;
       case "assistant_text":
-        output.write(`\n${event.text}\n`);
+        if (!sawTextDelta) output.write(`\n${event.text}\n`);
         break;
       case "tool_start":
         output.write(
@@ -388,6 +413,15 @@ async function questionHidden(question: string): Promise<string> {
 }
 
 function printHelp(): void {
+  const providers = listProviders()
+    .map(
+      (provider) =>
+        `  ${provider.id.padEnd(10)} ${provider.envKey}${
+          provider.baseURL ? ` (${provider.baseURL})` : ""
+        }`,
+    )
+    .join("\n");
+
   output.write(`agent-core
 
 Usage:
@@ -396,8 +430,8 @@ Usage:
 
 Options:
   -p, --prompt <text>             Run a single prompt and exit
-      --api-key <key>             Anthropic API key (or ANTHROPIC_API_KEY)
-      --model <model>             Model (default: ANTHROPIC_MODEL or claude-sonnet-4-6)
+      --api-key <key>             API key for the selected provider
+      --model <provider/model>    Model (default: AGENT_CORE_MODEL, ANTHROPIC_MODEL, or claude-sonnet-4-6)
       --cwd <path>                Working directory for tools
       --max-turns <n>             Max model/tool loop turns
   -c, --continue [id]             Continue latest session, or the provided session id/path
@@ -412,7 +446,19 @@ Options:
 
 Interactive commands:
   /exit, /clear, /usage, /tools, /sessions, /model <name>
+
+Provider prefixes:
+${providers}
+
+Bare model names are treated as anthropic/<model> for backwards compatibility.
 `);
+}
+
+function resolveProviderInfo(model: string): ReturnType<typeof listProviders>[number] {
+  const { providerId } = parseProviderModel(model);
+  const provider = listProviders().find((entry) => entry.id === providerId);
+  if (!provider) throw new Error(`Unknown provider '${providerId}'`);
+  return provider;
 }
 
 main().catch((error) => {

@@ -1,8 +1,9 @@
-import type { Anthropic } from "@anthropic-ai/sdk";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import type { NeutralMessage } from "./providers/types.js";
 import { pathExists } from "./utils/fs.js";
 import { truncateMiddle } from "./utils/json.js";
+import type { Workspace } from "./workspace/types.js";
 
 const MAX_INSTRUCTION_BYTES = 64 * 1024;
 const MAX_TOTAL_ATTACHMENT_CHARS = 120000;
@@ -14,11 +15,12 @@ export type ProjectInstruction = {
 
 export type AgentContext = {
   projectInstructions: ProjectInstruction[];
-  attachmentMessages: Anthropic.MessageParam[];
+  attachmentMessages: NeutralMessage[];
 };
 
 export async function buildAgentContext(options: {
   cwd: string;
+  workspace?: Workspace;
   additionalInstructionDirs?: string[];
 }): Promise<AgentContext> {
   const projectInstructions = await discoverProjectInstructions(options);
@@ -30,6 +32,7 @@ export async function buildAgentContext(options: {
 
 export async function discoverProjectInstructions(options: {
   cwd: string;
+  workspace?: Workspace;
   additionalInstructionDirs?: string[];
 }): Promise<ProjectInstruction[]> {
   const candidates = new Set<string>();
@@ -42,8 +45,8 @@ export async function discoverProjectInstructions(options: {
 
   const instructions: ProjectInstruction[] = [];
   for (const filePath of candidates) {
-    if (!(await pathExists(filePath))) continue;
-    const content = await readLimitedTextFile(filePath);
+    if (!(await instructionExists(filePath, options.workspace))) continue;
+    const content = await readLimitedTextFile(filePath, options.workspace);
     if (!content.trim()) continue;
     instructions.push({
       path: filePath,
@@ -67,7 +70,7 @@ export function formatProjectInstructionIndex(
 
 function buildContextAttachmentMessages(
   instructions: ProjectInstruction[],
-): Anthropic.MessageParam[] {
+): NeutralMessage[] {
   if (instructions.length === 0) return [];
 
   let remaining = MAX_TOTAL_ATTACHMENT_CHARS;
@@ -85,10 +88,15 @@ function buildContextAttachmentMessages(
     {
       role: "user",
       content: [
-        "The following context attachments were discovered before the conversation started. Use them as project guidance.",
-        "",
-        ...blocks,
-      ].join("\n"),
+        {
+          type: "text",
+          text: [
+            "The following context attachments were discovered before the conversation started. Use them as project guidance.",
+            "",
+            ...blocks,
+          ].join("\n"),
+        },
+      ],
     },
   ];
 }
@@ -105,8 +113,20 @@ function getAncestorDirs(cwd: string): string[] {
   return dirs;
 }
 
-async function readLimitedTextFile(filePath: string): Promise<string> {
-  const buffer = await readFile(filePath);
+async function instructionExists(
+  filePath: string,
+  workspace?: Workspace,
+): Promise<boolean> {
+  return workspace ? workspace.exists(filePath) : pathExists(filePath);
+}
+
+async function readLimitedTextFile(
+  filePath: string,
+  workspace?: Workspace,
+): Promise<string> {
+  const buffer = workspace
+    ? Buffer.from(await workspace.readBytes(filePath))
+    : await readFile(filePath);
   const truncated = buffer.byteLength > MAX_INSTRUCTION_BYTES;
   const slice = truncated ? buffer.subarray(0, MAX_INSTRUCTION_BYTES) : buffer;
   const content = slice.toString("utf8");

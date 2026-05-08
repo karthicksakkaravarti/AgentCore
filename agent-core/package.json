@@ -1,22 +1,28 @@
 {
-  "name": "agent-core",
+  "name": "@agent-core/core",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "Standalone TypeScript agent core migrated from the source Claude-style coding agent.",
-  "bin": {
-    "agent-core": "./dist/cli.js"
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
   },
   "scripts": {
-    "dev": "tsx src/cli.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/cli.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.60.0",
-    "dotenv": "^16.4.7",
+    "@google/genai": "^1.52.0",
+    "@supabase/supabase-js": "^2.105.3",
     "fast-glob": "^3.3.3",
+    "openai": "^6.36.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {

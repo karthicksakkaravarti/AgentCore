@@ -1,0 +1,32 @@
+{
+  "name": "agent-core-next-sales-chat",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Next.js sales chat sample powered by agent-core.",
+  "scripts": {
+    "dev": "npm --prefix ../../agent-core run build && next dev --webpack",
+    "build": "npm --prefix ../../agent-core run build && next build --webpack",
+    "start": "next start",
+    "typecheck": "npm --prefix ../../agent-core run build && tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@agent-core/core": "file:../../agent-core",
+    "lucide-react": "^1.14.0",
+    "next": "^16.2.5",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.2"
+  },
+  "overrides": {
+    "postcss": "^8.5.14"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

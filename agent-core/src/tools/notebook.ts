@@ -1,7 +1,5 @@
 import crypto from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
 import type { AgentTool } from "../types.js";
-import { resolvePath } from "../utils/fs.js";
 import { asString } from "../utils/json.js";
 
 type NotebookCell = {
@@ -48,8 +46,11 @@ export const NotebookEditTool: AgentTool = {
   readOnly: false,
   destructive: false,
   async execute(input, context) {
-    const filePath = resolvePath(asString(input.notebook_path), context.cwd);
-    const raw = await readFile(filePath, "utf8").catch((error: Error) => error);
+    const filePath = context.workspace.resolvePath(
+      asString(input.notebook_path),
+      context.cwd,
+    );
+    const raw = await context.workspace.read(filePath).catch((error: Error) => error);
     if (raw instanceof Error) {
       return { content: `Could not read notebook: ${raw.message}`, isError: true };
     }
@@ -88,7 +89,7 @@ export const NotebookEditTool: AgentTool = {
       }
     }
 
-    await writeFile(filePath, `${JSON.stringify(notebook, null, 2)}\n`, "utf8");
+    await context.workspace.write(filePath, `${JSON.stringify(notebook, null, 2)}\n`);
     context.state.readFiles.add(filePath);
     return { content: `${mode} applied to ${filePath}.` };
   },

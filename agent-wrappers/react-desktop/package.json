@@ -1,0 +1,34 @@
+{
+  "name": "agent-core-react-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Electron React desktop sample powered by agent-core.",
+  "main": "./dist-electron/main.js",
+  "scripts": {
+    "dev": "npm --prefix ../../agent-core run build && concurrently \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "build": "npm --prefix ../../agent-core run build && tsc -p tsconfig.electron.json && vite build",
+    "typecheck": "npm --prefix ../../agent-core run build && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.electron.json --noEmit",
+    "start": "electron ."
+  },
+  "dependencies": {
+    "@agent-core/core": "file:../../agent-core",
+    "electron": "^41.5.0",
+    "lucide-react": "^1.14.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^6.0.1",
+    "concurrently": "^9.2.1",
+    "typescript": "^5.7.2",
+    "vite": "^8.0.11",
+    "wait-on": "^9.0.5"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

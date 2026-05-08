@@ -1,7 +1,5 @@
 import type { AgentTool } from "../types.js";
 import { asNumber, asString, truncateMiddle } from "../utils/json.js";
-import { execShellCommand } from "../utils/process.js";
-import { startBackgroundShell } from "./backgroundShells.js";
 
 function looksDestructive(command: string): boolean {
   return /\b(rm\s+-rf|sudo\b|git\s+push\b|git\s+reset\b|git\s+clean\b|chmod\s+-R|chown\s+-R|mkfs|dd\s+if=|:\(\)\s*\{)/.test(
@@ -46,7 +44,7 @@ export const BashTool: AgentTool = {
     if (!command) return { content: "Missing command.", isError: true };
 
     if (input.run_in_background === true) {
-      const shell = startBackgroundShell(command, context.cwd);
+      const shell = context.runtime.spawn(command, { cwd: context.cwd });
       context.state.backgroundShells.set(shell.id, shell);
       return {
         content: `Started background shell ${shell.id}\nCommand: ${command}`,
@@ -57,7 +55,7 @@ export const BashTool: AgentTool = {
       min: 1000,
       max: 600000,
     });
-    const result = await execShellCommand(command, {
+    const result = await context.runtime.exec(command, {
       cwd: context.cwd,
       timeoutMs,
       signal: context.abortSignal,

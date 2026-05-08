@@ -1,6 +1,6 @@
 import os from "node:os";
 import { formatProjectInstructionIndex, type ProjectInstruction } from "./context.js";
-import { execShellCommand } from "./utils/process.js";
+import type { Runtime } from "./runtime/types.js";
 
 const DEFAULT_AGENT_PROMPT = `You are a local software engineering agent. Use the available tools to inspect the workspace, edit files, run commands, and help the user complete programming tasks.
 
@@ -17,6 +17,8 @@ const DEFAULT_AGENT_PROMPT = `You are a local software engineering agent. Use th
 export async function buildSystemPrompt(options: {
   cwd: string;
   model: string;
+  providerId: string;
+  runtime: Runtime;
   customSystemPrompt?: string;
   appendSystemPrompt?: string;
   projectInstructions?: ProjectInstruction[];
@@ -34,7 +36,12 @@ export async function buildSystemPrompt(options: {
       .join("\n\n");
   }
 
-  const context = await buildContextBlock(options.cwd, options.model);
+  const context = await buildContextBlock(
+    options.cwd,
+    options.model,
+    options.providerId,
+    options.runtime,
+  );
   return [
     DEFAULT_AGENT_PROMPT,
     context,
@@ -45,12 +52,18 @@ export async function buildSystemPrompt(options: {
     .join("\n\n");
 }
 
-async function buildContextBlock(cwd: string, model: string): Promise<string> {
-  const git = await getGitSnapshot(cwd);
+async function buildContextBlock(
+  cwd: string,
+  model: string,
+  providerId: string,
+  runtime: Runtime,
+): Promise<string> {
+  const git = await getGitSnapshot(cwd, runtime);
   return [
     "# Runtime Context",
     `- Date: ${new Date().toISOString().slice(0, 10)}`,
     `- Platform: ${os.type()} ${os.release()} (${os.platform()} ${os.arch()})`,
+    `- Provider: ${formatProvider(providerId)}`,
     `- Model: ${model}`,
     `- Working directory: ${cwd}`,
     git ? `\n# Git Snapshot\n${git}` : "",
@@ -59,8 +72,15 @@ async function buildContextBlock(cwd: string, model: string): Promise<string> {
     .join("\n");
 }
 
-async function getGitSnapshot(cwd: string): Promise<string | null> {
-  const isGit = await execShellCommand("git rev-parse --is-inside-work-tree", {
+function formatProvider(providerId: string): string {
+  return providerId === "anthropic" ? "Anthropic" : providerId;
+}
+
+async function getGitSnapshot(
+  cwd: string,
+  runtime: Runtime,
+): Promise<string | null> {
+  const isGit = await runtime.exec("git rev-parse --is-inside-work-tree", {
     cwd,
     timeoutMs: 2000,
     signal: new AbortController().signal,
@@ -68,17 +88,17 @@ async function getGitSnapshot(cwd: string): Promise<string | null> {
   if (isGit.exitCode !== 0 || isGit.stdout.trim() !== "true") return null;
 
   const [branch, status, log] = await Promise.all([
-    execShellCommand("git branch --show-current", {
+    runtime.exec("git branch --show-current", {
       cwd,
       timeoutMs: 3000,
       signal: new AbortController().signal,
     }),
-    execShellCommand("git --no-optional-locks status --short", {
+    runtime.exec("git --no-optional-locks status --short", {
       cwd,
       timeoutMs: 3000,
       signal: new AbortController().signal,
     }),
-    execShellCommand("git --no-optional-locks log --oneline -n 5", {
+    runtime.exec("git --no-optional-locks log --oneline -n 5", {
       cwd,
       timeoutMs: 3000,
       signal: new AbortController().signal,

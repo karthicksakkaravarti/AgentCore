@@ -6,9 +6,14 @@
 # Dependencies and build output
 node_modules/
 dist/
+dist-electron/
+.next/
+*.tsbuildinfo
 
 # Local environment and OS files
 .env
 .env.*
 !.env.example
 .DS_Store
+
+.agent-core

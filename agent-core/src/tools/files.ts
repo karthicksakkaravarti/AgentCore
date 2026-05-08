@@ -1,7 +1,6 @@
-import { readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AgentTool } from "../types.js";
-import { ensureParentDirectory, formatLineNumber, isDirectory, resolvePath } from "../utils/fs.js";
+import { formatLineNumber } from "../utils/fs.js";
 import { asBoolean, asNumber, asString, truncateMiddle } from "../utils/json.js";
 
 const DEFAULT_READ_LINES = 2000;
@@ -32,18 +31,21 @@ export const ReadTool: AgentTool = {
   readOnly: true,
   concurrencySafe: true,
   async execute(input, context) {
-    const filePath = resolvePath(asString(input.file_path), context.cwd);
-    if (await isDirectory(filePath)) {
+    const filePath = context.workspace.resolvePath(
+      asString(input.file_path),
+      context.cwd,
+    );
+    const info = await context.workspace.stat(filePath).catch((error: Error) => error);
+    if (info instanceof Error) {
+      return { content: `Could not stat ${filePath}: ${info.message}`, isError: true };
+    }
+    if (info.type === "directory") {
       return {
         content: `${filePath} is a directory. Use Bash(ls) or Glob to inspect directories.`,
         isError: true,
       };
     }
 
-    const info = await stat(filePath).catch((error: Error) => error);
-    if (info instanceof Error) {
-      return { content: `Could not stat ${filePath}: ${info.message}`, isError: true };
-    }
     if (info.size > MAX_READ_BYTES) {
       return {
         content: `${filePath} is ${(info.size / 1024 / 1024).toFixed(1)} MB. Refusing to read more than ${MAX_READ_BYTES / 1024 / 1024} MB at once. Use offset/limit or a shell command for targeted extraction.`,
@@ -51,15 +53,15 @@ export const ReadTool: AgentTool = {
       };
     }
 
-    const buffer = await readFile(filePath);
-    if (buffer.includes(0)) {
+    const buffer = await context.workspace.readBytes(filePath);
+    if (includesNullByte(buffer)) {
       return {
         content: `${filePath} appears to be a binary file (${buffer.length} bytes).`,
         isError: true,
       };
     }
 
-    const text = buffer.toString("utf8");
+    const text = new TextDecoder().decode(buffer);
     context.state.readFiles.add(filePath);
     if (path.extname(filePath) === ".ipynb") {
       return { content: truncateMiddle(renderNotebook(text, filePath), 40000) };
@@ -102,10 +104,12 @@ export const WriteTool: AgentTool = {
   readOnly: false,
   destructive: true,
   async execute(input, context) {
-    const filePath = resolvePath(asString(input.file_path), context.cwd);
+    const filePath = context.workspace.resolvePath(
+      asString(input.file_path),
+      context.cwd,
+    );
     const content = asString(input.content);
-    await ensureParentDirectory(filePath);
-    await writeFile(filePath, content, "utf8");
+    await context.workspace.write(filePath, content);
     context.state.readFiles.add(filePath);
     return {
       content: `Wrote ${Buffer.byteLength(content, "utf8")} bytes to ${filePath}.`,
@@ -139,7 +143,10 @@ export const EditTool: AgentTool = {
   readOnly: false,
   destructive: false,
   async execute(input, context) {
-    const filePath = resolvePath(asString(input.file_path), context.cwd);
+    const filePath = context.workspace.resolvePath(
+      asString(input.file_path),
+      context.cwd,
+    );
     const oldString = asString(input.old_string);
     const newString = asString(input.new_string);
     const replaceAll = asBoolean(input.replace_all);
@@ -154,7 +161,7 @@ export const EditTool: AgentTool = {
       };
     }
 
-    const text = await readFile(filePath, "utf8").catch((error: Error) => error);
+    const text = await context.workspace.read(filePath).catch((error: Error) => error);
     if (text instanceof Error) {
       return { content: `Could not read ${filePath}: ${text.message}`, isError: true };
     }
@@ -176,7 +183,7 @@ export const EditTool: AgentTool = {
     const next = replaceAll
       ? text.split(oldString).join(newString)
       : text.replace(oldString, newString);
-    await writeFile(filePath, next, "utf8");
+    await context.workspace.write(filePath, next);
     context.state.readFiles.add(filePath);
     return {
       content: `Edited ${filePath}. Replaced ${replaceAll ? count : 1} occurrence${(replaceAll ? count : 1) === 1 ? "" : "s"}.`,
@@ -208,4 +215,8 @@ function renderNotebook(raw: string, filePath: string): string {
   } catch {
     return `File: ${filePath}\n${raw}`;
   }
+}
+
+function includesNullByte(buffer: Uint8Array): boolean {
+  return buffer.some((byte) => byte === 0);
 }

@@ -1,15 +1,23 @@
-import Anthropic from "@anthropic-ai/sdk";
-import type { Anthropic as AnthropicTypes } from "@anthropic-ai/sdk";
 import { buildAgentContext } from "./context.js";
 import { decidePermission, isToolConcurrencySafe } from "./permissions.js";
+import type { LLMProvider } from "./providers/provider.js";
+import { resolveProvider } from "./providers/registry.js";
+import type {
+  NeutralContentBlock,
+  NeutralMessage,
+  NeutralToolDefinition,
+  NeutralUsage,
+  ProviderStopReason,
+} from "./providers/types.js";
+import { ZERO_USAGE } from "./providers/types.js";
 import {
   createSessionId,
-  getSessionPath,
-  initializeTranscript,
-  recordMessage,
-  recordUsage,
+  FileSystemSessionStorage,
+  type SessionStorageBackend,
 } from "./sessionStorage.js";
 import { buildSystemPrompt } from "./systemPrompt.js";
+import { LocalRuntime } from "./runtime/local.js";
+import type { Runtime } from "./runtime/types.js";
 import type {
   AgentEvent,
   AgentOptions,
@@ -23,27 +31,22 @@ import type {
 } from "./types.js";
 import { filterTools, findTool, defaultTools } from "./tools/registry.js";
 import { stringifyForToolResult } from "./utils/json.js";
+import { LocalWorkspace } from "./workspace/local.js";
+import type { Workspace } from "./workspace/types.js";
 
-type ToolUseBlock = {
-  type: "tool_use";
-  id: string;
-  name: string;
-  input: unknown;
-};
-
-type TextBlock = {
-  type: "text";
-  text: string;
-};
+type ToolUseBlock = Extract<NeutralContentBlock, { type: "tool_use" }>;
 
 const DEFAULT_MODEL = "claude-sonnet-4-6";
 
 export class AgentCore {
-  private readonly client: Anthropic;
+  private provider: LLMProvider;
   private readonly tools: AgentTool[];
   private readonly state: AgentState;
   private readonly abortController: AbortController;
-  private messages: AnthropicTypes.MessageParam[] = [];
+  private readonly workspace: Workspace;
+  private readonly runtime: Runtime;
+  private readonly sessionStorage: SessionStorageBackend;
+  private messages: NeutralMessage[] = [];
   private contextInjected: boolean;
   private transcriptStarted = false;
   private sessionId: string;
@@ -54,17 +57,19 @@ export class AgentCore {
   private options: AgentOptions;
 
   constructor(options: AgentOptions = {}) {
-    const apiKey = options.apiKey ?? process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      throw new Error(
-        "Missing Anthropic API key. Set ANTHROPIC_API_KEY or pass apiKey.",
-      );
-    }
-
     this.options = options;
-    this.client = new Anthropic({ apiKey });
     this.cwd = options.cwd ?? process.cwd();
-    this.model = options.model ?? process.env.ANTHROPIC_MODEL ?? DEFAULT_MODEL;
+    this.workspace = options.workspace ?? new LocalWorkspace({ cwd: this.cwd });
+    this.cwd = this.workspace.cwd;
+    this.runtime = options.runtime ?? new LocalRuntime();
+    this.sessionStorage =
+      options.sessionStorage ?? new FileSystemSessionStorage({ cwd: this.cwd });
+    this.model =
+      options.model ??
+      process.env.AGENT_CORE_MODEL ??
+      process.env.ANTHROPIC_MODEL ??
+      DEFAULT_MODEL;
+    this.provider = resolveProvider(this.model, { apiKey: options.apiKey });
     this.sessionId = options.sessionId ?? createSessionId();
     this.maxTurns = options.maxTurns ?? 20;
     this.maxTokens = options.maxTokens ?? 4096;
@@ -95,7 +100,7 @@ export class AgentCore {
     return this.tools.map((tool) => tool.name);
   }
 
-  getMessages(): AnthropicTypes.MessageParam[] {
+  getMessages(): NeutralMessage[] {
     return structuredClone(this.messages);
   }
 
@@ -107,7 +112,9 @@ export class AgentCore {
   }
 
   setModel(model: string): void {
+    const provider = resolveProvider(model, { apiKey: this.options.apiKey });
     this.model = model;
+    this.provider = provider;
   }
 
   getUsage(): AgentState["usage"] {
@@ -117,7 +124,7 @@ export class AgentCore {
   getSessionInfo(): { sessionId: string; path: string; persisted: boolean } {
     return {
       sessionId: this.sessionId,
-      path: getSessionPath(this.cwd, this.sessionId),
+      path: this.sessionStorage.getSessionPath?.(this.sessionId) ?? "",
       persisted: this.shouldPersist(),
     };
   }
@@ -130,11 +137,14 @@ export class AgentCore {
     const maxTurns = runOptions.maxTurns ?? this.maxTurns;
     const context = await buildAgentContext({
       cwd: this.cwd,
+      workspace: this.workspace,
       additionalInstructionDirs: this.options.additionalInstructionDirs,
     });
     const system = await buildSystemPrompt({
       cwd: this.cwd,
       model: this.model,
+      providerId: this.provider.id,
+      runtime: this.runtime,
       customSystemPrompt: this.options.customSystemPrompt,
       appendSystemPrompt: this.options.appendSystemPrompt,
       projectInstructions: context.projectInstructions,
@@ -149,9 +159,9 @@ export class AgentCore {
       this.contextInjected = true;
     }
 
-    const userMessage: AnthropicTypes.MessageParam = {
+    const userMessage: NeutralMessage = {
       role: "user",
-      content: prompt,
+      content: [{ type: "text", text: prompt }],
     };
     this.messages.push(userMessage);
     await this.recordMessage(userMessage);
@@ -160,58 +170,42 @@ export class AgentCore {
 
     for (let turn = 1; turn <= maxTurns; turn += 1) {
       this.emit({ type: "request", turn, model: this.model });
-      const response = await this.client.messages.create(
-        {
-          model: this.model,
-          max_tokens: this.maxTokens,
-          system,
-          messages: this.messages,
-          tools: this.tools.map((tool) => ({
-            name: tool.name,
-            description: tool.description,
-            input_schema: tool.inputSchema,
-          })),
-        },
-        { signal },
+      const assistantMessage = await this.collectAssistantMessage(
+        system,
+        signal,
       );
 
-      this.accumulateUsage(response.usage);
+      this.accumulateUsage(assistantMessage.usage);
       await this.recordUsage();
-      this.emit({ type: "assistant_message", message: response });
+      this.emit({ type: "assistant_message", message: assistantMessage.message });
       this.emit({ type: "usage", usage: this.getUsage() });
-      const assistantMessage: AnthropicTypes.MessageParam = {
-        role: "assistant",
-        content: response.content as AnthropicTypes.MessageParam["content"],
-      };
-      this.messages.push(assistantMessage);
-      await this.recordMessage(assistantMessage);
+      this.messages.push(assistantMessage.message);
+      await this.recordMessage(assistantMessage.message);
 
-      const contentBlocks = response.content as unknown[];
-      const textBlocks = contentBlocks.filter(isTextBlock);
-      for (const block of textBlocks) {
-        finalText += block.text;
-        this.emit({ type: "assistant_text", text: block.text });
+      if (assistantMessage.text) {
+        finalText += assistantMessage.text;
+        this.emit({ type: "assistant_text", text: assistantMessage.text });
       }
 
-      const toolUses = contentBlocks.filter(isToolUseBlock);
+      const toolUses = assistantMessage.message.content.filter(isToolUseBlock);
       if (toolUses.length === 0) {
         return {
           text: finalText,
           sessionId: this.sessionId,
           messages: this.getMessages(),
           usage: this.getUsage(),
-          stoppedBy: "end_turn",
+          stoppedBy: stopReasonToRunResult(assistantMessage.stopReason),
         };
       }
 
       const toolResults = await this.executeToolUses(toolUses, signal);
-      const toolResultMessage: AnthropicTypes.MessageParam = {
+      const toolResultMessage: NeutralMessage = {
         role: "user",
         content: toolResults.map(({ id, result }) => ({
           type: "tool_result",
-          tool_use_id: id,
+          toolUseId: id,
           content: result.content,
-          is_error: result.isError === true,
+          isError: result.isError === true,
         })),
       };
       this.messages.push(toolResultMessage);
@@ -299,6 +293,8 @@ export class AgentCore {
   private createToolContext(signal: AbortSignal): ToolExecutionContext {
     return {
       cwd: this.cwd,
+      workspace: this.workspace,
+      runtime: this.runtime,
       abortSignal: signal,
       state: this.state,
       askUser: this.options.askUser,
@@ -306,6 +302,9 @@ export class AgentCore {
         const subagent = new AgentCore({
           ...this.options,
           cwd: this.cwd,
+          workspace: this.workspace,
+          runtime: this.runtime,
+          sessionStorage: this.sessionStorage,
           model: this.model,
           maxTurns: Math.min(8, this.maxTurns),
           persistSession: false,
@@ -333,12 +332,108 @@ export class AgentCore {
     };
   }
 
-  private accumulateUsage(usage: AnthropicTypes.Usage): void {
-    this.state.usage.inputTokens += usage.input_tokens ?? 0;
-    this.state.usage.outputTokens += usage.output_tokens ?? 0;
-    this.state.usage.cacheCreationInputTokens +=
-      usage.cache_creation_input_tokens ?? 0;
-    this.state.usage.cacheReadInputTokens += usage.cache_read_input_tokens ?? 0;
+  private async collectAssistantMessage(
+    system: string,
+    signal: AbortSignal,
+  ): Promise<{
+    message: NeutralMessage;
+    text: string;
+    usage: NeutralUsage;
+    stopReason: ProviderStopReason;
+  }> {
+    const content: NeutralContentBlock[] = [];
+    const toolUseBlocks = new Map<string, ToolUseBlock>();
+    let text = "";
+    let usage: NeutralUsage = { ...ZERO_USAGE };
+    let stopReason: ProviderStopReason = "end_turn";
+
+    for await (const event of this.provider.stream({
+      system,
+      messages: this.messages,
+      tools: this.getNeutralTools(),
+      maxTokens: this.maxTokens,
+      signal,
+    })) {
+      switch (event.type) {
+        case "text_delta":
+          text += event.text;
+          appendTextDelta(content, event.text);
+          this.emit({ type: "text_delta", text: event.text });
+          break;
+        case "tool_use_start": {
+          const block: ToolUseBlock = {
+            type: "tool_use",
+            id: event.id,
+            name: event.name,
+            input: {},
+          };
+          content.push(block);
+          toolUseBlocks.set(event.id, block);
+          this.emit({
+            type: "tool_use_delta",
+            id: event.id,
+            name: event.name,
+          });
+          break;
+        }
+        case "tool_use_input_delta":
+          this.emit({
+            type: "tool_use_delta",
+            id: event.id,
+            partialJson: event.partialJson,
+          });
+          break;
+        case "tool_use_end": {
+          const block = toolUseBlocks.get(event.id);
+          if (block) {
+            block.input = event.input;
+          } else {
+            content.push({
+              type: "tool_use",
+              id: event.id,
+              name: "tool",
+              input: event.input,
+            });
+          }
+          this.emit({
+            type: "tool_use_delta",
+            id: event.id,
+            input: event.input,
+            done: true,
+          });
+          break;
+        }
+        case "message_end":
+          usage = event.usage;
+          stopReason = event.stopReason;
+          break;
+      }
+    }
+
+    return {
+      message: {
+        role: "assistant",
+        content: content.length > 0 ? content : [{ type: "text", text: "" }],
+      },
+      text,
+      usage,
+      stopReason,
+    };
+  }
+
+  private getNeutralTools(): NeutralToolDefinition[] {
+    return this.tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+    }));
+  }
+
+  private accumulateUsage(usage: NeutralUsage): void {
+    this.state.usage.inputTokens += usage.inputTokens;
+    this.state.usage.outputTokens += usage.outputTokens;
+    this.state.usage.cacheCreationInputTokens += usage.cacheCreationInputTokens;
+    this.state.usage.cacheReadInputTokens += usage.cacheReadInputTokens;
   }
 
   private emit(event: AgentEvent): void {
@@ -351,7 +446,7 @@ export class AgentCore {
 
   private async ensureTranscriptStarted(): Promise<void> {
     if (this.transcriptStarted || !this.shouldPersist()) return;
-    await initializeTranscript({
+    await this.sessionStorage.initSession({
       cwd: this.cwd,
       model: this.model,
       sessionId: this.sessionId,
@@ -359,26 +454,25 @@ export class AgentCore {
     this.transcriptStarted = true;
   }
 
-  private async recordMessage(message: AnthropicTypes.MessageParam): Promise<void> {
+  private async recordMessage(message: NeutralMessage): Promise<void> {
     if (!this.shouldPersist()) return;
     await this.ensureTranscriptStarted();
-    await recordMessage(this.cwd, this.sessionId, message);
+    await this.sessionStorage.appendEntry(this.sessionId, {
+      type: "message",
+      at: new Date().toISOString(),
+      message,
+    });
   }
 
   private async recordUsage(): Promise<void> {
     if (!this.shouldPersist()) return;
     await this.ensureTranscriptStarted();
-    await recordUsage(this.cwd, this.sessionId, this.getUsage());
+    await this.sessionStorage.appendEntry(this.sessionId, {
+      type: "usage",
+      at: new Date().toISOString(),
+      usage: this.getUsage(),
+    });
   }
-}
-
-function isTextBlock(block: unknown): block is TextBlock {
-  return (
-    typeof block === "object" &&
-    block !== null &&
-    (block as { type?: unknown }).type === "text" &&
-    typeof (block as { text?: unknown }).text === "string"
-  );
 }
 
 function isToolUseBlock(block: unknown): block is ToolUseBlock {
@@ -389,6 +483,29 @@ function isToolUseBlock(block: unknown): block is ToolUseBlock {
     typeof (block as { id?: unknown }).id === "string" &&
     typeof (block as { name?: unknown }).name === "string"
   );
+}
+
+function appendTextDelta(content: NeutralContentBlock[], text: string): void {
+  const last = content.at(-1);
+  if (last?.type === "text") {
+    last.text += text;
+  } else {
+    content.push({ type: "text", text });
+  }
+}
+
+function stopReasonToRunResult(
+  stopReason: ProviderStopReason,
+): AgentRunResult["stoppedBy"] {
+  switch (stopReason) {
+    case "end_turn":
+    case "max_tokens":
+      return stopReason;
+    case "tool_use":
+      return "other";
+    case "other":
+      return "other";
+  }
 }
 
 function normalizeInput(input: unknown): JsonObject {
