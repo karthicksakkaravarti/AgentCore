@@ -23,17 +23,9 @@ type ChatRequest = {
   sessionId?: string;
   model?: string;
   apiKey?: string;
-  lead?: {
-    name?: string;
-    company?: string;
-    stage?: string;
-    value?: string;
-  };
 };
 
-const SALES_SYSTEM_PROMPT = `You are a concise sales copilot inside a CRM chat surface.
-Help the seller prepare replies, summarize account context, identify objections, and propose next actions.
-Do not claim to have contacted a prospect or changed CRM data unless the user explicitly provides that result.`;
+const SYSTEM_PROMPT = `You are a helpful, intelligent AI assistant. Answer clearly and concisely.`;
 
 const SALES_SAFE_TOOLS = [
   "Read",
@@ -60,7 +52,7 @@ export async function POST(request: Request): Promise<Response> {
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      const textFilter = createThinkBlockFilter();
+      const textSplitter = createThinkBlockSplitter();
       try {
         const agent = new AgentCore({
           apiKey: body.apiKey,
@@ -77,17 +69,15 @@ export async function POST(request: Request): Promise<Response> {
           permissionMode: "acceptEdits",
           allowedTools: SALES_SAFE_TOOLS,
           initialMessages: toNeutralMessages(messages.slice(0, -1)),
-          customSystemPrompt: [
-            SALES_SYSTEM_PROMPT,
-            body.lead ? formatLeadContext(body.lead) : undefined,
-          ]
-            .filter(Boolean)
-            .join("\n\n"),
+          customSystemPrompt: SYSTEM_PROMPT,
           onEvent(event) {
             switch (event.type) {
-              case "text_delta":
-                writeTextDelta(controller, encoder, textFilter.push(event.text));
+              case "text_delta": {
+                const { visible, thinking } = textSplitter.push(event.text);
+                writeTextDelta(controller, encoder, visible);
+                writeThinkingDelta(controller, encoder, thinking);
                 break;
+              }
               case "tool_start":
                 writeJson(controller, encoder, {
                   type: "tool_start",
@@ -110,7 +100,9 @@ export async function POST(request: Request): Promise<Response> {
         });
 
         const result = await agent.run(prompt);
-        writeTextDelta(controller, encoder, textFilter.flush());
+        const flushed = textSplitter.flush();
+        writeTextDelta(controller, encoder, flushed.visible);
+        writeThinkingDelta(controller, encoder, flushed.thinking);
         writeJson(controller, encoder, {
           type: "done",
           sessionId: result.sessionId,
@@ -132,6 +124,7 @@ export async function POST(request: Request): Promise<Response> {
     headers: {
       "Content-Type": "application/x-ndjson; charset=utf-8",
       "Cache-Control": "no-cache",
+      "X-Accel-Buffering": "no",
     },
   });
 }
@@ -203,18 +196,6 @@ function toNeutralMessages(messages: ChatMessage[]): NeutralMessage[] {
   }));
 }
 
-function formatLeadContext(lead: NonNullable<ChatRequest["lead"]>): string {
-  return [
-    "# Current Lead",
-    lead.name ? `- Name: ${lead.name}` : undefined,
-    lead.company ? `- Company: ${lead.company}` : undefined,
-    lead.stage ? `- Stage: ${lead.stage}` : undefined,
-    lead.value ? `- Value: ${lead.value}` : undefined,
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
-
 function writeJson(
   controller: ReadableStreamDefaultController<Uint8Array>,
   encoder: TextEncoder,
@@ -229,10 +210,16 @@ function writeTextDelta(
   text: string,
 ): void {
   if (!text) return;
-  writeJson(controller, encoder, {
-    type: "text_delta",
-    text,
-  });
+  writeJson(controller, encoder, { type: "text_delta", text });
+}
+
+function writeThinkingDelta(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  encoder: TextEncoder,
+  text: string,
+): void {
+  if (!text) return;
+  writeJson(controller, encoder, { type: "thinking_delta", text });
 }
 
 function truncate(content: string, max: number): string {
@@ -240,9 +227,11 @@ function truncate(content: string, max: number): string {
   return `${content.slice(0, max - 1)}...`;
 }
 
-function createThinkBlockFilter(): {
-  push(text: string): string;
-  flush(): string;
+type SplitResult = { visible: string; thinking: string };
+
+function createThinkBlockSplitter(): {
+  push(text: string): SplitResult;
+  flush(): SplitResult;
 } {
   const openTag = "<think>";
   const closeTag = "</think>";
@@ -250,17 +239,20 @@ function createThinkBlockFilter(): {
   let insideThinkBlock = false;
 
   return {
-    push(text: string): string {
+    push(text: string): SplitResult {
       buffer += text;
       let visible = "";
+      let thinking = "";
 
       for (;;) {
         if (insideThinkBlock) {
           const closeIndex = buffer.indexOf(closeTag);
           if (closeIndex === -1) {
+            thinking += buffer.slice(0, buffer.length - keepPotentialTagPrefix(buffer, closeTag).length);
             buffer = keepPotentialTagPrefix(buffer, closeTag);
-            return visible;
+            return { visible, thinking };
           }
+          thinking += buffer.slice(0, closeIndex);
           buffer = buffer.slice(closeIndex + closeTag.length);
           insideThinkBlock = false;
           continue;
@@ -271,7 +263,7 @@ function createThinkBlockFilter(): {
           const suffix = keepPotentialTagPrefix(buffer, openTag);
           visible += buffer.slice(0, buffer.length - suffix.length);
           buffer = suffix;
-          return visible;
+          return { visible, thinking };
         }
 
         visible += buffer.slice(0, openIndex);
@@ -279,15 +271,16 @@ function createThinkBlockFilter(): {
         insideThinkBlock = true;
       }
     },
-    flush(): string {
+    flush(): SplitResult {
       if (insideThinkBlock) {
+        const thinking = buffer;
         buffer = "";
         insideThinkBlock = false;
-        return "";
+        return { visible: "", thinking };
       }
       const visible = buffer;
       buffer = "";
-      return visible;
+      return { visible, thinking: "" };
     },
   };
 }

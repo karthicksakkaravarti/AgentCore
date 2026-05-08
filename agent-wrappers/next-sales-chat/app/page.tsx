@@ -1,7 +1,8 @@
 "use client";
 
-import { Check, Loader2, RefreshCw, Send, Sparkles, UserRound, X } from "lucide-react";
-import { useMemo, useState } from "react";
+import { Check, Loader2, RefreshCw, Sparkles, X, MessageSquare, ArrowUp, Menu } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 
 type ToolActivity = {
   id: string;
@@ -13,70 +14,86 @@ type ToolActivity = {
 type ChatMessage = {
   role: "user" | "assistant";
   content: string;
+  thinking?: string;
   tools?: ToolActivity[];
+};
+
+type Conversation = {
+  id: string;
+  title: string;
+  messages: ChatMessage[];
+  sessionId?: string;
 };
 
 type StreamEvent =
   | { type: "text_delta"; text: string }
+  | { type: "thinking_delta"; text: string }
   | { type: "tool_start"; id: string; name: string; input: unknown }
   | { type: "tool_result"; id: string; name: string; ok: boolean; summary: string }
   | { type: "done"; sessionId: string; stoppedBy: string; usage: unknown }
   | { type: "error"; message: string };
 
-const leads = [
-  {
-    name: "Maya Chen",
-    company: "Northstar Foods",
-    stage: "Procurement review",
-    value: "$84k",
-    tone: "Cost-sensitive",
-  },
-  {
-    name: "Arjun Patel",
-    company: "HelioGrid",
-    stage: "Security validation",
-    value: "$126k",
-    tone: "Technical buyer",
-  },
-  {
-    name: "Lena Ortiz",
-    company: "Brightline Health",
-    stage: "Champion mapping",
-    value: "$42k",
-    tone: "Relationship-led",
-  },
+const capabilityCards = [
+  { title: "Explain a concept", desc: "Break down complex topics" },
+  { title: "Write some code", desc: "Build applications and scripts" },
+  { title: "Summarize text", desc: "Get the key points quickly" },
+  { title: "Brainstorm ideas", desc: "Generate creative concepts" },
 ];
 
-const starters = [
-  "Draft a follow-up after a pricing objection.",
-  "Summarize the deal risk and next best action.",
-  "Write a concise executive recap for this lead.",
-];
-
-export default function SalesChatPage() {
-  const [selectedLead, setSelectedLead] = useState(leads[0]);
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      role: "assistant",
-      content:
-        "Pick a lead and ask for a reply, recap, objection plan, or next action.",
-    },
-  ]);
+export default function ChatPage() {
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [isRunning, setIsRunning] = useState(false);
-  const [model, setModel] = useState("openai/gpt-4o");
-  const [sessionId, setSessionId] = useState<string>();
+  const [model, setModel] = useState("claude-sonnet-4-6");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  const pipelineTotal = useMemo(
-    () => leads.reduce((sum, lead) => sum + Number(lead.value.replace(/\D/g, "")), 0),
-    [],
-  );
+  const activeConversation = conversations.find(c => c.id === activeId);
+  const messages = activeConversation?.messages ?? [];
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  const handleNewChat = () => {
+    const newId = Date.now().toString();
+    const newConv: Conversation = { id: newId, title: "New Chat", messages: [] };
+    setConversations([newConv, ...conversations]);
+    setActiveId(newId);
+    setSidebarOpen(false);
+  };
 
   async function sendMessage(text = draft) {
     const prompt = text.trim();
     if (!prompt || isRunning) return;
-    const nextMessages = [...messages, { role: "user" as const, content: prompt }];
-    setMessages([...nextMessages, { role: "assistant", content: "" }]);
+    
+    let currentActiveId = activeId;
+    let currentConversations = [...conversations];
+    let currentConv = currentConversations.find(c => c.id === currentActiveId);
+    
+    if (!currentConv || !currentActiveId) {
+      currentActiveId = Date.now().toString();
+      currentConv = { 
+        id: currentActiveId, 
+        title: prompt.slice(0, 40) + (prompt.length > 40 ? "..." : ""), 
+        messages: [] 
+      };
+      currentConversations = [currentConv, ...currentConversations];
+      setActiveId(currentActiveId);
+    } else if (currentConv.messages.length === 0) {
+      currentConv.title = prompt.slice(0, 40) + (prompt.length > 40 ? "..." : "");
+    }
+    
+    const nextMessages = [...currentConv.messages, { role: "user" as const, content: prompt }];
+    
+    currentConv.messages = [...nextMessages, { role: "assistant" as const, content: "" }];
+    setConversations(currentConversations);
     setDraft("");
     setIsRunning(true);
 
@@ -86,9 +103,8 @@ export default function SalesChatPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           messages: nextMessages,
-          sessionId,
+          sessionId: currentConv.sessionId,
           model,
-          lead: selectedLead,
         }),
       });
 
@@ -106,176 +122,219 @@ export default function SalesChatPage() {
         for (const line of lines) {
           if (!line.trim()) continue;
           const event = JSON.parse(line) as StreamEvent;
-          switch (event.type) {
-            case "text_delta":
-              setMessages((current) => appendAssistantDelta(current, event.text));
-              break;
-            case "tool_start":
-              setMessages((current) =>
-                appendAssistantToolStart(current, {
-                  id: event.id,
-                  name: event.name,
-                  status: "running",
-                  summary: formatToolInput(event.input),
-                }),
-              );
-              break;
-            case "tool_result":
-              setMessages((current) =>
-                appendAssistantToolResult(current, {
-                  id: event.id,
-                  name: event.name,
-                  status: event.ok ? "ok" : "error",
-                  summary: event.summary,
-                }),
-              );
-              break;
-            case "done":
-              setSessionId(event.sessionId);
-              break;
-            case "error":
-              setMessages((current) =>
-                appendAssistantDelta(current, `\n${event.message}`),
-              );
-              break;
+          
+          if (event.type === "text_delta" || event.type === "thinking_delta") {
+            flushSync(() => {
+              setConversations(prevConvs => {
+                const nextConvs = [...prevConvs];
+                const convIndex = nextConvs.findIndex(c => c.id === currentActiveId);
+                if (convIndex === -1) return prevConvs;
+                const conv = { ...nextConvs[convIndex] };
+                if (event.type === "text_delta") {
+                  conv.messages = appendAssistantDelta(conv.messages, event.text);
+                } else {
+                  conv.messages = appendAssistantThinking(conv.messages, event.text);
+                }
+                nextConvs[convIndex] = conv;
+                return nextConvs;
+              });
+            });
+          } else {
+            setConversations(prevConvs => {
+              const nextConvs = [...prevConvs];
+              const convIndex = nextConvs.findIndex(c => c.id === currentActiveId);
+              if (convIndex === -1) return prevConvs;
+              const conv = { ...nextConvs[convIndex] };
+              switch (event.type) {
+                case "tool_start":
+                  conv.messages = appendAssistantToolStart(conv.messages, {
+                    id: event.id,
+                    name: event.name,
+                    status: "running",
+                    summary: formatToolInput(event.input),
+                  });
+                  break;
+                case "tool_result":
+                  conv.messages = appendAssistantToolResult(conv.messages, {
+                    id: event.id,
+                    name: event.name,
+                    status: event.ok ? "ok" : "error",
+                    summary: event.summary,
+                  });
+                  break;
+                case "done":
+                  conv.sessionId = event.sessionId;
+                  break;
+                case "error":
+                  conv.messages = appendAssistantDelta(conv.messages, `\n${event.message}`);
+                  break;
+              }
+              nextConvs[convIndex] = conv;
+              return nextConvs;
+            });
           }
         }
       }
     } catch (error) {
-      setMessages((current) =>
-        appendAssistantDelta(
-          current,
-          error instanceof Error ? error.message : String(error),
-        ),
-      );
+      setConversations(prevConvs => {
+        const nextConvs = [...prevConvs];
+        const convIndex = nextConvs.findIndex(c => c.id === currentActiveId);
+        if (convIndex === -1) return prevConvs;
+        const conv = { ...nextConvs[convIndex] };
+        conv.messages = appendAssistantDelta(
+          conv.messages,
+          error instanceof Error ? error.message : String(error)
+        );
+        nextConvs[convIndex] = conv;
+        return nextConvs;
+      });
     } finally {
       setIsRunning(false);
     }
   }
 
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  };
+
+  const adjustTextareaHeight = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setDraft(e.target.value);
+    e.target.style.height = 'auto';
+    e.target.style.height = `${Math.min(e.target.scrollHeight, 200)}px`;
+  };
+
   return (
     <main className="shell">
-      <aside className="leadRail" aria-label="Leads">
-        <div className="brand">
-          <Sparkles size={18} />
-          <span>Sales Desk</span>
-        </div>
-        <div className="metric">
-          <span>Pipeline</span>
-          <strong>${pipelineTotal}k</strong>
-        </div>
-        <div className="leadList">
-          {leads.map((lead) => (
-            <button
-              className={lead.name === selectedLead.name ? "lead active" : "lead"}
-              key={lead.name}
-              onClick={() => setSelectedLead(lead)}
-              type="button"
-            >
-              <UserRound size={18} />
-              <span>
-                <strong>{lead.name}</strong>
-                <small>{lead.company}</small>
-              </span>
-            </button>
-          ))}
-        </div>
-      </aside>
-
-      <section className="chatPane" aria-label="Chat">
-        <header className="chatHeader">
-          <div>
-            <h1>{selectedLead.company}</h1>
-            <p>
-              {selectedLead.stage} / {selectedLead.value}
-            </p>
+      <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`} style={sidebarOpen ? { display: 'flex', position: 'absolute', zIndex: 10, height: '100%', width: '260px' } : {}}> 
+        <div className="sidebar-header">
+          <div className="brand">
+            <Sparkles size={20} />
+            <span>AI Chat</span>
           </div>
-          <label>
-            <span>Model</span>
-            <input
-              value={model}
-              onChange={(event) => setModel(event.target.value)}
-              spellCheck={false}
-            />
-          </label>
-        </header>
-
-        <div className="messages">
-          {messages.map((message, index) => (
-            <div className={`message ${message.role}`} key={index}>
-              {message.tools && message.tools.length > 0 ? (
-                <div className="toolList">
-                  {message.tools.map((tool) => (
-                    <div className={`toolChip ${tool.status}`} key={tool.id}>
-                      {tool.status === "running" ? (
-                        <Loader2 size={14} />
-                      ) : tool.status === "ok" ? (
-                        <Check size={14} />
-                      ) : (
-                        <X size={14} />
-                      )}
-                      <span className="toolName">{tool.name}</span>
-                      {tool.summary ? <span>{tool.summary}</span> : null}
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-              {message.content ||
-                (message.role === "assistant" && !message.tools?.length ? "..." : "")}
-            </div>
-          ))}
-        </div>
-
-        <div className="starterRow">
-          {starters.map((starter) => (
-            <button
-              key={starter}
-              onClick={() => sendMessage(starter)}
-              type="button"
-              disabled={isRunning}
-            >
-              {starter}
-            </button>
-          ))}
-        </div>
-
-        <form
-          className="composer"
-          onSubmit={(event) => {
-            event.preventDefault();
-            sendMessage();
-          }}
-        >
-          <textarea
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            placeholder="Ask about this opportunity"
-            rows={3}
-          />
-          <button disabled={isRunning || !draft.trim()} type="submit">
-            {isRunning ? <RefreshCw size={18} /> : <Send size={18} />}
-            <span>{isRunning ? "Running" : "Send"}</span>
+          <button className="new-chat-btn" onClick={handleNewChat} aria-label="New Chat">
+            <MessageSquare size={18} />
           </button>
-        </form>
-      </section>
+        </div>
+        
+        <div className="conversation-list">
+          {conversations.map((conv) => (
+            <button
+              key={conv.id}
+              className={`conversation-item ${conv.id === activeId ? 'active' : ''}`}
+              onClick={() => {
+                setActiveId(conv.id);
+                setSidebarOpen(false);
+              }}
+            >
+              {conv.title}
+            </button>
+          ))}
+        </div>
 
-      <aside className="insightPane" aria-label="Opportunity">
-        <h2>{selectedLead.name}</h2>
-        <dl>
-          <div>
-            <dt>Stage</dt>
-            <dd>{selectedLead.stage}</dd>
-          </div>
-          <div>
-            <dt>Value</dt>
-            <dd>{selectedLead.value}</dd>
-          </div>
-          <div>
-            <dt>Style</dt>
-            <dd>{selectedLead.tone}</dd>
-          </div>
-        </dl>
+        <div className="sidebar-footer">
+          <select value={model} onChange={(e) => setModel(e.target.value)}>
+            <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+            <option value="claude-opus-4-7">Claude Opus 4.7</option>
+            <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5</option>
+            <option value="openai/gpt-4o">GPT-4o</option>
+            <option value="minimax/MiniMax-M2.7">MiniMax M2.7</option>
+          </select>
+        </div>
       </aside>
+
+      <section className="chatArea">
+        <div className="mobile-nav">
+          <button onClick={() => setSidebarOpen(!sidebarOpen)}>
+            <Menu size={20} />
+          </button>
+          <span style={{ fontWeight: 600 }}>AI Chat</span>
+        </div>
+
+        {messages.length === 0 ? (
+          <div className="welcomeScreen">
+            <h1>How can I help you today?</h1>
+            <div className="capability-cards">
+              {capabilityCards.map((card, idx) => (
+                <div key={idx} className="capability-card" onClick={() => sendMessage(card.title)}>
+                  <strong>{card.title}</strong>
+                  <span>{card.desc}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="messages">
+            <div className="messages-inner">
+              {messages.map((message, index) => (
+                <div className={`message ${message.role}`} key={index}>
+                  {message.role === "assistant" ? (
+                    <div className="assistant-content-wrapper">
+                      <div className="assistant-avatar">
+                        <Sparkles size={16} />
+                      </div>
+                      <div className="message-bubble">
+                        {message.tools && message.tools.length > 0 ? (
+                          <div className="toolList">
+                            {message.tools.map((tool) => (
+                              <div className={`toolChip ${tool.status}`} key={tool.id}>
+                                {tool.status === "running" ? (
+                                  <Loader2 size={14} className="animate-spin" />
+                                ) : tool.status === "ok" ? (
+                                  <Check size={14} />
+                                ) : (
+                                  <X size={14} />
+                                )}
+                                <span className="toolName">{tool.name}</span>
+                                {tool.summary ? <span>{tool.summary}</span> : null}
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+                        {message.thinking && (
+                          <ThinkingBlock
+                            thinking={message.thinking}
+                            isStreaming={isRunning && index === messages.length - 1}
+                          />
+                        )}
+                        {message.content || (message.role === "assistant" && !message.tools?.length ? "..." : "")}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="message-bubble">
+                      {message.content}
+                    </div>
+                  )}
+                </div>
+              ))}
+              <div ref={messagesEndRef} />
+            </div>
+          </div>
+        )}
+
+        <div className="composer-wrapper">
+          <form
+            className="composer"
+            onSubmit={(event) => {
+              event.preventDefault();
+              sendMessage();
+            }}
+          >
+            <textarea
+              value={draft}
+              onChange={adjustTextareaHeight}
+              onKeyDown={handleKeyDown}
+              placeholder="Message AI Chat..."
+              rows={1}
+            />
+            <button disabled={isRunning || !draft.trim()} type="submit">
+              {isRunning ? <RefreshCw size={16} className="animate-spin" /> : <ArrowUp size={16} />}
+            </button>
+          </form>
+        </div>
+      </section>
     </main>
   );
 }
@@ -285,6 +344,15 @@ function appendAssistantDelta(messages: ChatMessage[], text: string): ChatMessag
   const last = next.at(-1);
   if (last?.role === "assistant") {
     next[next.length - 1] = { ...last, content: last.content + text };
+  }
+  return next;
+}
+
+function appendAssistantThinking(messages: ChatMessage[], text: string): ChatMessage[] {
+  const next = [...messages];
+  const last = next.at(-1);
+  if (last?.role === "assistant") {
+    next[next.length - 1] = { ...last, thinking: (last.thinking ?? "") + text };
   }
   return next;
 }
@@ -320,6 +388,25 @@ function appendAssistantToolResult(
         : [...tools, tool],
   };
   return next;
+}
+
+function ThinkingBlock({ thinking, isStreaming }: { thinking: string; isStreaming: boolean }) {
+  const [open, setOpen] = useState(isStreaming);
+
+  useEffect(() => {
+    if (isStreaming) setOpen(true);
+  }, [isStreaming]);
+
+  return (
+    <details
+      className="thinking-block"
+      open={open}
+      onToggle={(e) => setOpen(e.currentTarget.open)}
+    >
+      <summary>Thinking</summary>
+      <div className="thinking-content">{thinking}</div>
+    </details>
+  );
 }
 
 function formatToolInput(input: unknown): string {
