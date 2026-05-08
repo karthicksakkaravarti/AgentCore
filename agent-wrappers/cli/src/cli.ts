@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import "dotenv/config";
-import readline from "node:readline/promises";
+import * as readline from "node:readline";
+import * as readlinePromises from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import {
   AgentCore,
@@ -9,7 +10,6 @@ import {
   loadLatestSession,
   loadSessionById,
   parseProviderModel,
-  type AgentEvent,
   type AgentTool,
   type JsonObject,
   type LoadedSession,
@@ -17,7 +17,11 @@ import {
   type PermissionMode,
   type SessionSummary,
 } from "@agent-core/core";
+import chalk from "chalk";
+import { printBanner } from "./banner.js";
+import { createEventPrinter } from "./events.js";
 import { truncateMiddle } from "./format.js";
+import * as theme from "./theme.js";
 
 type CliArgs = {
   apiKey?: string;
@@ -35,6 +39,23 @@ type CliArgs = {
   help: boolean;
 };
 
+const SLASH_COMMANDS = [
+  "/exit",
+  "/clear",
+  "/usage",
+  "/tools",
+  "/sessions",
+  "/model",
+];
+
+function completer(line: string): readline.CompleterResult {
+  if (line.startsWith("/")) {
+    const hits = SLASH_COMMANDS.filter((command) => command.startsWith(line));
+    return [hits.length ? hits : SLASH_COMMANDS, line];
+  }
+  return [[], line];
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
@@ -42,7 +63,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const rl = readline.createInterface({ input, output });
+  const rl = readlinePromises.createInterface({ input, output, completer });
   const cwd = args.cwd ?? process.cwd();
 
   if (args.listSessionsOnly) {
@@ -76,24 +97,25 @@ async function main(): Promise<void> {
     allowedTools: args.allowedTools,
     disabledTools: args.disabledTools,
     askUser: async (question) => {
-      output.write(`\nagent asks> ${question}\n`);
-      return rl.question("you> ");
+      output.write(theme.dimText(`\nagent asks> ${question}\n`));
+      return rl.question(theme.promptSymbol);
     },
     permissionPrompt: async (tool, toolInput, options) =>
       promptForPermission(rl, tool, toolInput, options.reason),
     onEvent: createEventPrinter(args.verbose),
   });
 
-  output.write(
-    `Agent core ready. Model: ${selectedModel}\n`,
-  );
-  output.write(`CWD: ${cwd}\n`);
-  output.write(`Session: ${agent.getSessionInfo().sessionId}\n`);
-  output.write(`Transcript: ${agent.getSessionInfo().path}\n`);
-  output.write(`Tools: ${agent.listTools().join(", ")}\n`);
+  printBanner("0.1.0");
+  output.write(chalk.bold.green("  Agent ready\n"));
+  output.write(theme.dimText(`  Model:   ${selectedModel}\n`));
+  output.write(theme.dimText(`  CWD:     ${cwd}\n`));
+  output.write(theme.dimText(`  Session: ${agent.getSessionInfo().sessionId}\n`));
+  output.write(theme.dimText(`  Log:     ${agent.getSessionInfo().path}\n`));
+  output.write(theme.dimText(`  Tools:   ${agent.listTools().join(", ")}\n`));
   if (restored) {
-    output.write(`Resumed ${restored.messages.length} prior message(s).\n`);
+    output.write(theme.dimText(`  Resumed ${restored.messages.length} prior message(s).\n`));
   }
+  output.write("\n");
 
   if (args.prompt) {
     const result = await agent.run(args.prompt);
@@ -105,22 +127,36 @@ async function main(): Promise<void> {
     return;
   }
 
-  output.write("\nType /exit to quit, /clear to reset history, /usage for token usage.\n\n");
   for (;;) {
-    const prompt = (await rl.question("you> ")).trim();
+    const lines: string[] = [];
+    const firstLine = (await rl.question(theme.promptSymbol)).trimEnd();
+    if (!firstLine) continue;
+    lines.push(firstLine);
+    if (!firstLine.startsWith("/")) {
+      for (;;) {
+        const next = (await rl.question(chalk.dim("… "))).trimEnd();
+        if (next === "") break;
+        lines.push(next);
+      }
+    }
+    const prompt = lines.join("\n").trim();
     if (!prompt) continue;
     if (prompt === "/exit" || prompt === "/quit") break;
     if (prompt === "/clear") {
       agent.clearHistory();
-      output.write(`Conversation history cleared. New session: ${agent.getSessionInfo().sessionId}\n`);
+      output.write(
+        theme.dimText(
+          `Conversation history cleared. New session: ${agent.getSessionInfo().sessionId}\n`,
+        ),
+      );
       continue;
     }
     if (prompt === "/usage") {
-      output.write(`${JSON.stringify(agent.getUsage(), null, 2)}\n`);
+      output.write(theme.dimText(`${JSON.stringify(agent.getUsage(), null, 2)}\n`));
       continue;
     }
     if (prompt === "/tools") {
-      output.write(`${agent.listTools().join("\n")}\n`);
+      output.write(theme.dimText(`${agent.listTools().join("\n")}\n`));
       continue;
     }
     if (prompt === "/sessions") {
@@ -131,10 +167,10 @@ async function main(): Promise<void> {
       const model = prompt.slice("/model ".length).trim();
       try {
         agent.setModel(model);
-        output.write(`Model set to ${model}\n`);
+        output.write(theme.dimText(`Model set to ${model}\n`));
       } catch (error) {
         output.write(
-          `${error instanceof Error ? error.message : String(error)}\n`,
+          theme.errorText(`${error instanceof Error ? error.message : String(error)}\n`),
         );
       }
       continue;
@@ -245,7 +281,7 @@ function parsePermissionMode(value: string): PermissionMode {
 
 async function resolveSessionSelection(
   args: CliArgs,
-  rl: readline.Interface,
+  rl: readlinePromises.Interface,
   cwd: string,
 ): Promise<LoadedSession | undefined> {
   if (args.continueSession && args.resumeSession) {
@@ -287,12 +323,12 @@ async function resolveSessionSelection(
 
 function printSessionList(sessions: SessionSummary[]): void {
   if (sessions.length === 0) {
-    output.write("No saved sessions for this cwd.\n");
+    output.write(theme.dimText("No saved sessions for this cwd.\n"));
     return;
   }
-  output.write("Saved sessions:\n");
+  output.write(theme.dimText("Saved sessions:\n"));
   sessions.forEach((session, index) => {
-    output.write(`${index + 1}. ${formatSessionSummary(session)}\n`);
+    output.write(theme.dimText(`${index + 1}. ${formatSessionSummary(session)}\n`));
   });
 }
 
@@ -303,16 +339,24 @@ function formatSessionSummary(session: SessionSummary): string {
 }
 
 async function promptForPermission(
-  rl: readline.Interface,
+  rl: readlinePromises.Interface,
   tool: AgentTool,
   inputValue: JsonObject,
   reason: string,
 ): Promise<PermissionDecision> {
-  output.write(`\nTool permission requested: ${tool.name}\n`);
-  output.write(`${reason}\n`);
-  output.write(`${truncateMiddle(JSON.stringify(inputValue, null, 2), 4000)}\n`);
+  const inputStr = truncateMiddle(JSON.stringify(inputValue, null, 2), 4000);
+  output.write("\n" + theme.permBoxTop + "\n");
+  output.write(
+    theme.permBoxSide + " " + theme.permToolName(` Tool: ${tool.name}`) + "\n",
+  );
+  output.write(theme.permBoxSide + " " + theme.permReason(reason) + "\n");
+  output.write(theme.permBoxSide + "\n");
+  for (const line of inputStr.split("\n").slice(0, 10)) {
+    output.write(theme.permBoxSide + " " + theme.dimText(line) + "\n");
+  }
+  output.write(theme.permBoxBottom + "\n");
   const answer = (
-    await rl.question("Allow? [y]es / [a]lways / [n]o / [q]uit: ")
+    await rl.question(chalk.yellow("  Allow? [y]es / [a]lways / [n]o / [q]uit: "))
   )
     .trim()
     .toLowerCase();
@@ -323,7 +367,11 @@ async function promptForPermission(
     return { behavior: "allow" };
   }
   if (answer === "q" || answer === "quit") {
-    return { behavior: "deny", message: "User quit during permission prompt.", interrupt: true };
+    return {
+      behavior: "deny",
+      message: "User quit during permission prompt.",
+      interrupt: true,
+    };
   }
   const message = await rl.question("Optional denial guidance: ");
   return {
@@ -332,52 +380,9 @@ async function promptForPermission(
   };
 }
 
-function createEventPrinter(verbose: boolean): (event: AgentEvent) => void {
-  let sawTextDelta = false;
-  return (event) => {
-    switch (event.type) {
-      case "request":
-        output.write(`\n[turn ${event.turn}] ${event.model}\n`);
-        sawTextDelta = false;
-        break;
-      case "text_delta":
-        sawTextDelta = true;
-        output.write(event.text);
-        break;
-      case "tool_use_delta":
-        if (verbose && event.partialJson) {
-          output.write(`[tool input] ${event.id} ${event.partialJson}\n`);
-        }
-        break;
-      case "assistant_text":
-        if (!sawTextDelta) output.write(`\n${event.text}\n`);
-        break;
-      case "tool_start":
-        output.write(
-          `\n[tool start] ${event.name} ${truncateMiddle(JSON.stringify(event.input), 1000)}\n`,
-        );
-        break;
-      case "tool_result": {
-        const body = verbose
-          ? event.result.content
-          : event.result.content.split(/\r?\n/).slice(0, 8).join("\n");
-        output.write(
-          `[tool ${event.result.isError ? "error" : "done"}] ${event.name}\n${truncateMiddle(body, verbose ? 12000 : 2000)}\n`,
-        );
-        break;
-      }
-      case "usage":
-        if (verbose) output.write(`[usage] ${JSON.stringify(event.usage)}\n`);
-        break;
-      case "assistant_message":
-        break;
-    }
-  };
-}
-
 async function questionHidden(question: string): Promise<string> {
   if (!process.stdin.isTTY || !process.stdin.setRawMode) {
-    const rl = readline.createInterface({ input, output });
+    const rl = readlinePromises.createInterface({ input, output });
     const answer = await rl.question(question);
     rl.close();
     return answer;
