@@ -1,0 +1,88 @@
+name: agent-core Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "agent-core/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "agent-core/**"
+
+jobs:
+  test:
+    name: Test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent-core
+
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["20", "22"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: agent-core/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Run tests with coverage
+        run: npm run test:coverage
+        env:
+          # Prevent tests from accidentally hitting real APIs
+          ANTHROPIC_API_KEY: ""
+          OPENAI_API_KEY: ""
+          GOOGLE_API_KEY: ""
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-node${{ matrix.node }}
+          path: agent-core/coverage/
+          retention-days: 14
+
+      - name: Write job summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## Test Results — Node ${{ matrix.node }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f coverage/coverage-summary.json ]; then
+            node --input-type=module << 'EOF' >> "$GITHUB_STEP_SUMMARY"
+            import { readFileSync } from 'fs';
+            const d = JSON.parse(readFileSync('coverage/coverage-summary.json', 'utf8'));
+            const t = d.total;
+            const fmt = (pct) => `${pct}%`;
+            const rows = [
+              ['Statements', fmt(t.statements.pct), `${t.statements.covered}/${t.statements.total}`],
+              ['Branches',   fmt(t.branches.pct),   `${t.branches.covered}/${t.branches.total}`],
+              ['Functions',  fmt(t.functions.pct),  `${t.functions.covered}/${t.functions.total}`],
+              ['Lines',      fmt(t.lines.pct),      `${t.lines.covered}/${t.lines.total}`],
+            ];
+            console.log('| Metric | Coverage | Covered/Total |');
+            console.log('|--------|----------|---------------|');
+            for (const [m, pct, ratio] of rows) {
+              console.log(`| ${m} | ${pct} | ${ratio} |`);
+            }
+EOF
+          else
+            echo "Coverage report not found." >> "$GITHUB_STEP_SUMMARY"
+          fi
