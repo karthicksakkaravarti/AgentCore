@@ -33,6 +33,7 @@ export {
   SupabaseSessionStorage,
 } from "./sessionStorage/supabase.js";
 export { DisabledRuntime, LocalRuntime } from "./runtime/index.js";
+export { loadMcpTools, type McpServerConfig } from "./mcp/index.js";
 export { defaultTools, filterTools, findTool } from "./tools/registry.js";
 export {
   LocalWorkspace,

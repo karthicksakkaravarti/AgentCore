@@ -73,6 +73,7 @@ export type AgentOptions = {
   onEvent?: (event: AgentEvent) => void;
   disabledTools?: string[];
   allowedTools?: string[];
+  additionalTools?: AgentTool[];
   abortController?: AbortController;
 };
 

@@ -59,10 +59,28 @@ const REGISTRY = {
     baseURL: "https://openrouter.ai/api/v1",
     openAICompatible: true,
   },
+  ollama: {
+    factory: createOpenAI,
+    envKey: "OLLAMA_API_KEY",
+    baseURL: "http://localhost:11434/v1",
+    openAICompatible: true,
+  },
+  perplexity: {
+    factory: createOpenAI,
+    envKey: "PERPLEXITY_API_KEY",
+    baseURL: "https://api.perplexity.ai",
+    openAICompatible: true,
+  },
   together: {
     factory: createOpenAI,
     envKey: "TOGETHER_API_KEY",
     baseURL: "https://api.together.xyz/v1",
+    openAICompatible: true,
+  },
+  aihubmix: {
+    factory: createOpenAI,
+    envKey: "AIHUBMIX_API_KEY",
+    baseURL: "https://aihubmix.com/v1",
     openAICompatible: true,
   },
 } satisfies Record<string, ProviderRegistryEntry>;
@@ -82,7 +100,10 @@ export function resolveProvider(
 ): LLMProvider {
   const { providerId, model } = parseProviderModel(modelString);
   const entry: ProviderRegistryEntry = REGISTRY[providerId];
-  const apiKey = normalizeApiKey(options.apiKey ?? process.env[entry.envKey]);
+  const apiKey =
+    providerId === "ollama"
+      ? normalizeApiKey(options.apiKey ?? process.env[entry.envKey]) ?? "ollama"
+      : normalizeApiKey(options.apiKey ?? process.env[entry.envKey]);
   if (!apiKey) {
     throw new Error(`Missing ${entry.envKey} for provider '${providerId}'`);
   }

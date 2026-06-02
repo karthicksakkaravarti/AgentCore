@@ -76,10 +76,13 @@ export class AgentCore {
     this.abortController = options.abortController ?? new AbortController();
     this.messages = structuredClone(options.initialMessages ?? []);
     this.contextInjected = this.messages.length > 0;
-    this.tools = filterTools(defaultTools(), {
-      allowedTools: options.allowedTools,
-      disabledTools: options.disabledTools,
-    });
+    this.tools = [
+      ...filterTools(defaultTools(), {
+        allowedTools: options.allowedTools,
+        disabledTools: options.disabledTools,
+      }),
+      ...(options.additionalTools ?? []),
+    ];
     this.state = {
       todos: [],
       backgroundShells: new Map(),
